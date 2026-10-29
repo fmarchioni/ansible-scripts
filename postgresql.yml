@@ -1,0 +1,321 @@
+# =============================================================================
+# PostgreSQL 15 da RHEL 8 AppStream - istanze indipendenti (nessuna replica)
+#
+# Parametri da riga di comando:
+#   -e pg_version=latest      ultima 15.x disponibile in AppStream
+#   -e pg_version=15.12       versione esatta, bloccata con dnf versionlock
+#   -e pg_memory=collaudo     (default) memoria identica all'ambiente di riferimento
+#   -e pg_memory=auto         memoria proporzionata alla RAM della VM
+#   -e pg_dba_user=<nome>     crea/aggiorna un ruolo PostgreSQL SUPERUSER con login
+#                             (la password viene chiesta a terminale, non e' salvata)
+#   -e pg_hosts='<pattern>'   VM su cui installare (default: '*postgres*')
+#
+# Esempi:
+#   ansible-playbook postgresql.yml --tags verify                   # solo verifica
+#   ansible-playbook postgresql.yml -e pg_version=latest -l '*postgres-prod-01'
+#   ansible-playbook postgresql.yml -e pg_version=latest -e pg_dba_user=dba_admin
+#
+# Nota: --check non e' significativo alla prima installazione (i pacchetti non ci sono ancora).
+# Prerequisiti: VM registrate (AppStream), disco dati montato su /var/lib/pgsql.
+# Idempotente: rilanciato non reinizializza i dati e non tocca cio' che e' gia' a posto.
+# =============================================================================
+
+- name: PostgreSQL | password del ruolo DBA (chiesta una sola volta)
+  hosts: localhost
+  gather_facts: false
+  tags: [install, dba]
+  tasks:
+    - name: Password del ruolo DBA
+      ansible.builtin.pause:
+        prompt: "Password per il ruolo PostgreSQL '{{ pg_dba_user }}' (non viene mostrata ne' salvata)"
+        echo: false
+      register: pg_dba_pw
+      when: (pg_dba_user | default('')) != '' and pg_dba_password is not defined
+      no_log: true
+
+    - name: Memorizza (solo in memoria, per questa esecuzione)
+      ansible.builtin.set_fact:
+        pg_dba_secret: "{{ pg_dba_password | default(pg_dba_pw.user_input | default('')) }}"
+      no_log: true
+
+    - name: Password non vuota
+      ansible.builtin.assert:
+        that: (pg_dba_user | default('')) == '' or (pg_dba_secret | length) >= 12
+        fail_msg: "Password vuota o troppo corta (minimo 12 caratteri)"
+        quiet: true
+
+- name: PostgreSQL | installazione e configurazione
+  hosts: "{{ pg_hosts | default('*postgres*') }}"
+  gather_facts: true
+  serial: 1                       # una VM alla volta: se la prima fallisce, la seconda non viene toccata
+  vars:
+    pg_stream: "15"
+    pg_memory: collaudo
+    pg_dba_user: ""
+    pg_root: /var/lib/pgsql
+    pg_data: /var/lib/pgsql/data
+    pg_locale: en_US.UTF-8
+    pg_lock_packages: [postgresql, postgresql-server, postgresql-private-libs]
+    # reti da cui accettare connessioni (default: la subnet della VM, dai facts)
+    pg_hba_cidrs: "{{ [ansible_default_ipv4.network ~ '/' ~ ansible_default_ipv4.prefix] if ansible_default_ipv4.prefix is defined
+                      else [ansible_default_ipv4.network ~ ' ' ~ ansible_default_ipv4.netmask] }}"
+
+    # ---- parametri dell'ambiente di riferimento (Collaudo) ----
+    pg_settings_common:
+      listen_addresses: "'*'"
+      max_connections: 400
+      work_mem: 4MB
+      max_wal_size: 1536MB
+      min_wal_size: 80MB
+      checkpoint_completion_target: 0.9
+      autovacuum_max_workers: 2
+      autovacuum_vacuum_scale_factor: 0.02
+      autovacuum_analyze_scale_factor: 0.01
+      idle_in_transaction_session_timeout: 300000     # ms (5 min)
+      idle_session_timeout: 300000                    # ms (5 min)
+      timezone: "'Etc/UTC'"
+      log_timezone: "'Etc/UTC'"
+      datestyle: "'iso, mdy'"
+      default_text_search_config: "'pg_catalog.english'"
+      lc_messages: "'{{ pg_locale }}'"
+      lc_monetary: "'{{ pg_locale }}'"
+      lc_numeric: "'{{ pg_locale }}'"
+      lc_time: "'{{ pg_locale }}'"
+      logging_collector: "on"
+      log_destination: "'stderr'"
+      log_directory: "'log'"
+      log_filename: "'postgresql-%a.log'"
+      log_rotation_age: 1d
+      log_rotation_size: 0
+      log_truncate_on_rotation: "on"
+      log_line_prefix: "'%m [%p] '"
+      password_encryption: "'scram-sha-256'"
+    pg_settings_memory:
+      collaudo:
+        shared_buffers: 512MB
+        effective_cache_size: 1GB
+        maintenance_work_mem: 64MB
+      auto:
+        shared_buffers: "{{ (ansible_memtotal_mb * 0.25) | int }}MB"
+        effective_cache_size: "{{ (ansible_memtotal_mb * 0.75) | int }}MB"
+        maintenance_work_mem: 512MB
+
+  handlers:
+    - name: Riavvio PostgreSQL
+      ansible.builtin.service:
+        name: postgresql
+        state: restarted
+
+  tasks:
+    - name: Controlli iniziali
+      tags: [always]
+      block:
+        - name: Parametri validi
+          ansible.builtin.assert:
+            that:
+              - "(ansible_run_tags | intersect(['all', 'install'])) | length == 0 or (pg_version | default('')) != ''"
+              - pg_memory in ['collaudo', 'auto']
+            fail_msg: "Specificare -e pg_version=latest oppure -e pg_version=15.x (pg_memory: collaudo|auto)"
+            quiet: true
+
+        - name: Disco dati montato su {{ pg_root }}
+          ansible.builtin.command: findmnt -n -o SOURCE,SIZE {{ pg_root }}
+          register: pg_mnt
+          changed_when: false
+          failed_when: false
+
+        - name: Disco dati presente
+          ansible.builtin.assert:
+            that: pg_mnt.rc == 0
+            fail_msg: "{{ pg_root }} non e' un punto di mount: i dati finirebbero sul disco di sistema. Interrotto."
+            quiet: true
+
+    # -------------------------------------------------------------------------
+    - name: Installazione
+      tags: [install]
+      block:
+        - name: Locale en_US (glibc-langpack-en)
+          ansible.builtin.dnf:
+            name: glibc-langpack-en
+            state: present
+
+        - name: Stream abilitato del modulo postgresql
+          ansible.builtin.shell: dnf -q module list --enabled postgresql 2>/dev/null | awk '$1=="postgresql"{print $2}'
+          register: pg_enabled_stream
+          changed_when: false
+
+        - name: Nessun altro stream gia' abilitato
+          ansible.builtin.assert:
+            that: pg_enabled_stream.stdout in ['', pg_stream]
+            fail_msg: "Risulta abilitato lo stream postgresql:{{ pg_enabled_stream.stdout }}: verificare a mano prima di procedere"
+            quiet: true
+
+        - name: Abilita postgresql:{{ pg_stream }}
+          ansible.builtin.command: dnf -y module enable postgresql:{{ pg_stream }}
+          when: pg_enabled_stream.stdout == ''
+
+        - name: Versione gia' bloccata?
+          ansible.builtin.shell: dnf -q versionlock list 2>/dev/null | grep -c '^postgresql' || true
+          register: pg_locked
+          changed_when: false
+
+        - name: Pacchetti PostgreSQL ({{ pg_version }})
+          ansible.builtin.dnf:
+            name: "{{ ['postgresql-server'] if pg_version == 'latest' else ['postgresql-server-' ~ pg_version, 'postgresql-' ~ pg_version] }}"
+            state: present
+
+        - name: Versione installata
+          ansible.builtin.command: rpm -q --qf '%{VERSION}' postgresql-server
+          register: pg_installed
+          changed_when: false
+
+        - name: Versione corrispondente a quella richiesta
+          ansible.builtin.assert:
+            that: pg_version == 'latest' or pg_installed.stdout == pg_version
+            fail_msg: "Installata {{ pg_installed.stdout }}, richiesta {{ pg_version }}"
+            quiet: true
+
+        - name: Blocco versione (solo con versione esatta)
+          when: pg_version != 'latest' and (pg_locked.stdout | int) == 0
+          block:
+            - name: Plugin versionlock
+              ansible.builtin.dnf:
+                name: python3-dnf-plugin-versionlock
+                state: present
+            - name: dnf versionlock add
+              ansible.builtin.command: dnf versionlock add {{ pg_lock_packages | join(' ') }}
+
+    # -------------------------------------------------------------------------
+    - name: Inizializzazione
+      tags: [install]
+      block:
+        - name: Proprietario e permessi di {{ pg_root }} (punto di mount)
+          ansible.builtin.file:
+            path: "{{ pg_root }}"
+            owner: postgres
+            group: postgres
+            mode: "0700"
+
+        - name: Contesto SELinux di {{ pg_root }} (il disco nuovo non ha l'etichetta postgresql_db_t)
+          ansible.builtin.command: restorecon -RF {{ pg_root }}
+          register: pg_restorecon
+          changed_when: false
+
+        - name: initdb (solo se non gia' inizializzato)
+          ansible.builtin.command: postgresql-setup --initdb
+          args:
+            creates: "{{ pg_data }}/PG_VERSION"
+          environment:
+            PGSETUP_INITDB_OPTIONS: "--encoding=UTF8 --locale={{ pg_locale }} --auth-local=peer --auth-host=scram-sha-256"
+
+    # -------------------------------------------------------------------------
+    - name: Configurazione
+      tags: [install, config]
+      block:
+        - name: Cartella conf.d
+          ansible.builtin.file:
+            path: "{{ pg_data }}/conf.d"
+            state: directory
+            owner: postgres
+            group: postgres
+            mode: "0700"
+
+        - name: Parametri (conf.d/10-impostazioni.conf)
+          ansible.builtin.copy:
+            dest: "{{ pg_data }}/conf.d/10-impostazioni.conf"
+            owner: postgres
+            group: postgres
+            mode: "0600"
+            content: |
+              # Gestito da Ansible (postgresql.yml) - memoria: {{ pg_memory }}
+              {% for k, v in (pg_settings_common | combine(pg_settings_memory[pg_memory])).items() %}
+              {{ k }} = {{ v }}
+              {% endfor %}
+          notify: Riavvio PostgreSQL
+
+        - name: include_dir in postgresql.conf
+          ansible.builtin.lineinfile:
+            path: "{{ pg_data }}/postgresql.conf"
+            regexp: "^include_dir\\s*="
+            line: "include_dir = 'conf.d'"
+            insertafter: EOF
+          notify: Riavvio PostgreSQL
+
+        - name: pg_hba.conf - accesso dalla rete (password SCRAM)
+          ansible.builtin.blockinfile:
+            path: "{{ pg_data }}/pg_hba.conf"
+            marker: "# {mark} ANSIBLE postgresql.yml"
+            block: |
+              {% for c in pg_hba_cidrs %}
+              host    all    all    {{ c }}    scram-sha-256
+              {% endfor %}
+          notify: Riavvio PostgreSQL
+
+        - name: firewalld attivo?
+          ansible.builtin.command: systemctl is-active firewalld
+          register: pg_fw
+          changed_when: false
+          failed_when: false
+
+        - name: Porta 5432 su firewalld
+          ansible.builtin.shell: |
+            firewall-cmd -q --query-service=postgresql && exit 0
+            firewall-cmd -q --permanent --add-service=postgresql && firewall-cmd -q --reload && echo CHANGED
+          register: pg_fwadd
+          changed_when: "'CHANGED' in pg_fwadd.stdout"
+          when: pg_fw.stdout == 'active'
+
+        - name: Servizio postgresql abilitato e avviato
+          ansible.builtin.service:
+            name: postgresql
+            state: started
+            enabled: true
+
+        - name: Applica subito eventuali modifiche
+          ansible.builtin.meta: flush_handlers
+
+    # -------------------------------------------------------------------------
+    - name: Ruolo DBA
+      tags: [install, dba]
+      when: pg_dba_user != ''
+      block:
+        - name: Crea o aggiorna il ruolo {{ pg_dba_user }} (SUPERUSER, LOGIN)
+          ansible.builtin.command:
+            cmd: runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1 -d postgres
+            stdin: |
+              SELECT format('CREATE ROLE %I', '{{ pg_dba_user }}')
+                WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ pg_dba_user }}') \gexec
+              ALTER ROLE "{{ pg_dba_user }}" WITH SUPERUSER LOGIN PASSWORD '{{ hostvars['localhost'].pg_dba_secret | replace("'", "''") }}';
+          no_log: true
+          changed_when: true
+
+    # -------------------------------------------------------------------------
+    - name: Verifica
+      tags: [always]
+      block:
+        - name: Stato dell'istanza
+          ansible.builtin.command:
+            cmd: runuser -u postgres -- psql -X -A -t -d postgres
+            stdin: |
+              SELECT 'versione              ' || current_setting('server_version');
+              SELECT 'encoding/locale       ' || pg_encoding_to_char(encoding) || ' / ' || datcollate FROM pg_database WHERE datname='postgres';
+              SELECT 'in recovery           ' || pg_is_in_recovery();
+              SELECT rpad(name, 22) || current_setting(name) FROM pg_settings
+               WHERE name IN ('data_directory','listen_addresses','max_connections','shared_buffers','effective_cache_size',
+                              'work_mem','maintenance_work_mem','TimeZone','idle_session_timeout','password_encryption')
+               ORDER BY name;
+              SELECT 'errori config         ' || count(*) FROM pg_file_settings WHERE error IS NOT NULL;
+              SELECT 'ruoli superuser       ' || string_agg(rolname, ', ') FROM pg_roles WHERE rolsuper;
+          register: pg_state
+          changed_when: false
+          failed_when: false
+
+        - name: Versionlock
+          ansible.builtin.shell: dnf -q versionlock list 2>/dev/null | grep '^postgresql' || echo 'nessun blocco'
+          register: pg_lockstate
+          changed_when: false
+
+        - name: Esito
+          ansible.builtin.debug:
+            msg: "{{ (pg_state.stdout_lines if pg_state.rc == 0 else ['PostgreSQL non in esecuzione o non installato: ' ~ pg_state.stderr])
+                     + ['disco dati            ' ~ pg_mnt.stdout, 'versionlock           ' ~ (pg_lockstate.stdout_lines | join(', '))] }}"
