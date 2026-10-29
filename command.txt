@@ -1,1 +1,0 @@
-ansible '*postgres-prod-01' -m shell -a "dnf -q module info postgresql:15 | grep -o 'postgresql-server-15[^ ]*x86_64' | sort -uV"
