@@ -6,7 +6,8 @@
 #   -e pg_version=15.12       versione esatta, bloccata con dnf versionlock
 #   -e pg_memory=collaudo     (default) memoria identica all'ambiente di riferimento
 #   -e pg_memory=auto         memoria proporzionata alla RAM della VM
-#   -e pg_dba_user=<nome>     crea/aggiorna un ruolo PostgreSQL SUPERUSER con login
+#   -e pg_dba_user=<nome>     crea/aggiorna un ruolo DBA (default: LOGIN CREATEDB, NON superuser)
+#   -e "pg_dba_attrs='LOGIN CREATEDB CREATEROLE'"   attributi diversi (vedi nota CREATEROLE sotto)
 #                             (la password viene chiesta a terminale, non e' salvata)
 #   -e pg_hosts='<pattern>'   VM su cui installare (default: '*postgres*')
 #
@@ -52,6 +53,9 @@
     pg_stream: "15"
     pg_memory: collaudo
     pg_dba_user: ""
+    # NOSUPERUSER e' sempre aggiunto. Nota: in PostgreSQL 15 CREATEROLE permette di
+    # assegnarsi i ruoli predefiniti (es. pg_execute_server_program): e' quasi superuser.
+    pg_dba_attrs: "LOGIN CREATEDB"
     pg_root: /var/lib/pgsql
     pg_data: /var/lib/pgsql/data
     pg_locale: en_US.UTF-8
@@ -279,13 +283,13 @@
       tags: [install, dba]
       when: pg_dba_user != ''
       block:
-        - name: Crea o aggiorna il ruolo {{ pg_dba_user }} (SUPERUSER, LOGIN)
+        - name: Crea o aggiorna il ruolo {{ pg_dba_user }} ({{ pg_dba_attrs }}, NOSUPERUSER)
           ansible.builtin.command:
             cmd: runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1 -d postgres
             stdin: |
               SELECT format('CREATE ROLE %I', '{{ pg_dba_user }}')
                 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ pg_dba_user }}') \gexec
-              ALTER ROLE "{{ pg_dba_user }}" WITH SUPERUSER LOGIN PASSWORD '{{ hostvars['localhost'].pg_dba_secret | replace("'", "''") }}';
+              ALTER ROLE "{{ pg_dba_user }}" WITH NOSUPERUSER {{ pg_dba_attrs }} PASSWORD '{{ hostvars['localhost'].pg_dba_secret | replace("'", "''") }}';
           no_log: true
           changed_when: true
 
@@ -306,6 +310,9 @@
                ORDER BY name;
               SELECT 'errori config         ' || count(*) FROM pg_file_settings WHERE error IS NOT NULL;
               SELECT 'ruoli superuser       ' || string_agg(rolname, ', ') FROM pg_roles WHERE rolsuper;
+              SELECT 'ruoli con login       ' || string_agg(rolname || ' (' || concat_ws(',', CASE WHEN rolsuper THEN 'super' END,
+                       CASE WHEN rolcreatedb THEN 'createdb' END, CASE WHEN rolcreaterole THEN 'createrole' END) || ')', ', ')
+                FROM pg_roles WHERE rolcanlogin;
           register: pg_state
           changed_when: false
           failed_when: false
