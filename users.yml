@@ -1,0 +1,188 @@
+# =============================================================================
+# Utenza applicativa su VM RHEL e Ubuntu (UID/GID fissi, password temporanea)
+#
+# Creazione (la password temporanea viene chiesta a terminale, non e' salvata;
+# al primo login l'utente DEVE cambiarla):
+#   ansible-playbook users.yml --tags create
+#
+# Sudo (quando confermato), senza ricreare l'utente ne' toccare la password:
+#   ansible-playbook users.yml --tags sudo -e user_sudo=group       # gruppo wheel (RHEL) / sudo (Ubuntu)
+#   ansible-playbook users.yml --tags sudo -e user_sudo=dedicated   # file /etc/sudoers.d/<utente>
+#   ansible-playbook users.yml --tags sudo -e user_sudo=none        # revoca sudo
+#   aggiungere -e user_sudo_nopasswd=true per sudo senza password (sconsigliato)
+#
+# Solo verifica:
+#   ansible-playbook users.yml --tags verify
+#
+# Altri parametri: -e user_name=... -e user_uid=... -e user_hosts='<pattern>'
+# Per la VM Ubuntu (utente non root) aggiungere -k -K se le password non sono nel vault.
+# =============================================================================
+
+- name: Utenza | password temporanea (chiesta una sola volta)
+  hosts: localhost
+  gather_facts: false
+  tags: [create]
+  tasks:
+    - name: Password temporanea
+      ansible.builtin.pause:
+        prompt: "Password temporanea per l'utente (non viene mostrata ne' salvata)"
+        echo: false
+      register: user_pw
+      when: user_password is not defined
+      no_log: true
+
+    - name: Memorizza (solo in memoria)
+      ansible.builtin.set_fact:
+        user_secret: "{{ user_password | default(user_pw.user_input | default('')) }}"
+      no_log: true
+
+    - name: Lunghezza minima
+      ansible.builtin.assert:
+        that: (user_secret | length) >= 12
+        fail_msg: "Password troppo corta (minimo 12 caratteri)"
+        quiet: true
+
+- name: Utenza | creazione, sudo, verifica
+  hosts: "{{ user_hosts | default('fews_rhel:fews_nfs') }}"
+  gather_facts: true
+  become: "{{ (ansible_user | default('root')) != 'root' }}"
+  vars:
+    user_name: fews-user
+    user_uid: 1001
+    user_gid: 1001
+    user_shell: /bin/bash
+    user_sudo: none                  # none | group | dedicated
+    user_sudo_nopasswd: false
+    user_admin_group: "{{ 'sudo' if ansible_os_family == 'Debian' else 'wheel' }}"
+    user_sudoers_file: "/etc/sudoers.d/{{ user_name }}"
+
+  tasks:
+    # -------------------------------------------------------------------------
+    - name: Controllo conflitti UID/GID
+      tags: [create]
+      block:
+        - name: Chi usa UID {{ user_uid }} e GID {{ user_gid }}
+          ansible.builtin.shell: |
+            echo "uid=$(getent passwd {{ user_uid }} | cut -d: -f1)"
+            echo "gid=$(getent group {{ user_gid }} | cut -d: -f1)"
+            echo "name=$(getent passwd {{ user_name }} | cut -d: -f3)"
+          register: user_ids
+          changed_when: false
+
+        - name: UID/GID liberi o gia' dell'utente
+          ansible.builtin.assert:
+            that:
+              - user_ids.stdout_lines[0] in ['uid=', 'uid=' ~ user_name]
+              - user_ids.stdout_lines[1] in ['gid=', 'gid=' ~ user_name]
+              - user_ids.stdout_lines[2] in ['name=', 'name=' ~ user_uid]
+            fail_msg: "Conflitto: {{ user_ids.stdout_lines | join(', ') }} (atteso UID/GID {{ user_uid }}/{{ user_gid }} liberi o di {{ user_name }})"
+            quiet: true
+
+        - name: Utente gia' presente?
+          ansible.builtin.set_fact:
+            user_existed: "{{ user_ids.stdout_lines[2] != 'name=' }}"
+
+    # -------------------------------------------------------------------------
+    - name: Creazione
+      tags: [create]
+      block:
+        - name: Gruppo {{ user_name }} (GID {{ user_gid }})
+          ansible.builtin.group:
+            name: "{{ user_name }}"
+            gid: "{{ user_gid }}"
+
+        - name: Utente {{ user_name }} (UID {{ user_uid }})
+          ansible.builtin.user:
+            name: "{{ user_name }}"
+            uid: "{{ user_uid }}"
+            group: "{{ user_name }}"
+            home: "/home/{{ user_name }}"
+            shell: "{{ user_shell }}"
+            create_home: true
+
+        - name: Password temporanea (solo utente nuovo; rilanciato non la cambia)
+          ansible.builtin.command:
+            cmd: chpasswd
+            stdin: "{{ user_name }}:{{ hostvars['localhost'].user_secret }}"
+          when: not user_existed
+          no_log: true
+
+        - name: Cambio password obbligatorio al primo login (solo utente nuovo)
+          ansible.builtin.command: chage -d 0 {{ user_name }}
+          when: not user_existed
+
+    # -------------------------------------------------------------------------
+    - name: Sudo
+      tags: [sudo]
+      block:
+        - name: Modalita' valida
+          ansible.builtin.assert:
+            that: user_sudo in ['none', 'group', 'dedicated']
+            fail_msg: "user_sudo deve essere none, group o dedicated"
+            quiet: true
+
+        - name: Utente esistente
+          ansible.builtin.command: id {{ user_name }}
+          changed_when: false
+
+        - name: Membro del gruppo {{ user_admin_group }}?
+          ansible.builtin.shell: id -nG {{ user_name }} | tr ' ' '\n' | grep -qx {{ user_admin_group }}
+          register: user_in_admin
+          changed_when: false
+          failed_when: false
+
+        - name: Aggiunta al gruppo {{ user_admin_group }}
+          ansible.builtin.user:
+            name: "{{ user_name }}"
+            groups: "{{ user_admin_group }}"
+            append: true
+          when: user_sudo == 'group'
+
+        - name: Rimozione dal gruppo {{ user_admin_group }}
+          ansible.builtin.command: gpasswd -d {{ user_name }} {{ user_admin_group }}
+          when: user_sudo != 'group' and user_in_admin.rc == 0
+
+        - name: Regola dedicata {{ user_sudoers_file }}
+          ansible.builtin.copy:
+            dest: "{{ user_sudoers_file }}"
+            content: "{{ user_name }} ALL=(ALL) {{ 'NOPASSWD: ' if user_sudo_nopasswd | bool else '' }}ALL\n"
+            owner: root
+            group: root
+            mode: "0440"
+            validate: visudo -cf %s
+          when: user_sudo == 'dedicated'
+
+        - name: Regola NOPASSWD per il gruppo (solo se richiesta)
+          ansible.builtin.copy:
+            dest: "{{ user_sudoers_file }}"
+            content: "{{ user_name }} ALL=(ALL) NOPASSWD: ALL\n"
+            owner: root
+            group: root
+            mode: "0440"
+            validate: visudo -cf %s
+          when: user_sudo == 'group' and user_sudo_nopasswd | bool
+
+        - name: Rimozione regola dedicata (se non serve)
+          ansible.builtin.file:
+            path: "{{ user_sudoers_file }}"
+            state: absent
+          when: user_sudo == 'none' or (user_sudo == 'group' and not user_sudo_nopasswd | bool)
+
+    # -------------------------------------------------------------------------
+    - name: Verifica
+      tags: [always]
+      block:
+        - name: Stato utente
+          ansible.builtin.shell: |
+            if ! id {{ user_name }} >/dev/null 2>&1; then echo "utente: NON PRESENTE"; exit 0; fi
+            echo "utente:   $(id {{ user_name }})"
+            echo "passwd:   $(getent passwd {{ user_name }})"
+            echo "password: $(chage -l {{ user_name }} | awk -F': ' '/^Last password change/{print $2}')"
+            s=$(sudo -n -l -U {{ user_name }} 2>/dev/null | sed -n '/may run the following/,$p' | tail -n +2 | xargs)
+            echo "sudo:     ${s:-nessuno}"
+          register: user_state
+          changed_when: false
+
+        - name: Esito
+          ansible.builtin.debug:
+            msg: "{{ user_state.stdout_lines }}"
