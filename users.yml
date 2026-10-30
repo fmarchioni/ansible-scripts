@@ -14,6 +14,10 @@
 # Solo verifica:
 #   ansible-playbook users.yml --tags verify
 #
+# Verifica che la password temporanea sia quella attesa, SENZA login
+# (confronto con /etc/shadow: non consuma il cambio obbligatorio al primo accesso):
+#   ansible-playbook users.yml --tags checkpw
+#
 # Altri parametri: -e user_name=... -e user_uid=... -e user_hosts='<pattern>'
 # Per la VM Ubuntu (utente non root) aggiungere -k -K se le password non sono nel vault.
 # =============================================================================
@@ -31,6 +35,21 @@
       when: user_password is not defined
       no_log: true
 
+    - name: Conferma password temporanea
+      ansible.builtin.pause:
+        prompt: "Ripeti la password temporanea"
+        echo: false
+      register: user_pw2
+      when: user_password is not defined
+      no_log: true
+
+    - name: Le due password coincidono
+      ansible.builtin.assert:
+        that: user_password is defined or user_pw.user_input == user_pw2.user_input
+        fail_msg: "Le due password non coincidono: nessuna modifica effettuata"
+        quiet: true
+      no_log: true
+
     - name: Memorizza (solo in memoria)
       ansible.builtin.set_fact:
         user_secret: "{{ user_password | default(user_pw.user_input | default('')) }}"
@@ -41,6 +60,24 @@
         that: (user_secret | length) >= 12
         fail_msg: "Password troppo corta (minimo 12 caratteri)"
         quiet: true
+
+- name: Utenza | password da verificare
+  hosts: localhost
+  gather_facts: false
+  tags: [checkpw, never]
+  tasks:
+    - name: Password da verificare
+      ansible.builtin.pause:
+        prompt: "Password da verificare (non viene mostrata)"
+        echo: false
+      register: user_pwc
+      when: user_password_check is not defined
+      no_log: true
+
+    - name: Memorizza (solo in memoria)
+      ansible.builtin.set_fact:
+        user_check_secret: "{{ user_password_check | default(user_pwc.user_input | default('')) }}"
+      no_log: true
 
 - name: Utenza | creazione, sudo, verifica
   hosts: "{{ user_hosts | default('fews_rhel:fews_nfs') }}"
@@ -167,6 +204,25 @@
             path: "{{ user_sudoers_file }}"
             state: absent
           when: user_sudo == 'none' or (user_sudo == 'group' and not user_sudo_nopasswd | bool)
+
+    # -------------------------------------------------------------------------
+    - name: Confronto password con /etc/shadow (nessun login)
+      tags: [checkpw, never]
+      block:
+        - name: Confronto
+          ansible.builtin.command:
+            cmd: >-
+              perl -e 'my $u=shift; my $pw=<STDIN>; chomp $pw; open(my $f,"<","/etc/shadow") or die;
+              while(<$f>){ my @x=split /:/; if($x[0] eq $u){ print((crypt($pw,$x[1]) eq $x[1]) ? "OK" : "KO"); exit } }
+              print "NOUSER"' {{ user_name }}
+            stdin: "{{ hostvars['localhost'].user_check_secret }}"
+          register: user_cmp
+          changed_when: false
+          no_log: true
+
+        - name: Esito confronto
+          ansible.builtin.debug:
+            msg: "{{ {'OK': 'password corretta', 'KO': 'password DIVERSA', 'NOUSER': 'utente non presente'}[user_cmp.stdout] }}"
 
     # -------------------------------------------------------------------------
     - name: Verifica
