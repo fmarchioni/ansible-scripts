@@ -19,6 +19,7 @@
 #   ansible-playbook users.yml --tags checkpw
 #
 # Altri parametri: -e user_name=... -e user_uid=... -e user_hosts='<pattern>'
+# Per limitare le VM usare -e user_hosts=fews_rhel (NON -l: escluderebbe la richiesta password).
 # Per la VM Ubuntu (utente non root) aggiungere -k -K se le password non sono nel vault.
 # =============================================================================
 
@@ -103,6 +104,8 @@
             echo "uid=$(getent passwd {{ user_uid }} | cut -d: -f1)"
             echo "gid=$(getent group {{ user_gid }} | cut -d: -f1)"
             echo "name=$(getent passwd {{ user_name }} | cut -d: -f3)"
+            h=$(getent shadow {{ user_name }} | cut -d: -f2)
+            case "$h" in ''|'!'|'!!'|'*'|'!*') echo "pw=none";; *) echo "pw=set";; esac
           register: user_ids
           changed_when: false
 
@@ -118,6 +121,8 @@
         - name: Utente gia' presente?
           ansible.builtin.set_fact:
             user_existed: "{{ user_ids.stdout_lines[2] != 'name=' }}"
+            # password da impostare: utente nuovo, oppure esistente ma senza password (es. esecuzione interrotta)
+            user_set_password: "{{ user_ids.stdout_lines[2] == 'name=' or user_ids.stdout_lines[3] == 'pw=none' }}"
 
     # -------------------------------------------------------------------------
     - name: Creazione
@@ -137,16 +142,23 @@
             shell: "{{ user_shell }}"
             create_home: true
 
-        - name: Password temporanea (solo utente nuovo; rilanciato non la cambia)
+        - name: Password temporanea disponibile
+          ansible.builtin.assert:
+            that: (hostvars['localhost'].user_secret | default('')) | length >= 12
+            fail_msg: "Password temporanea non acquisita: non usare -l (esclude localhost), usare -e user_hosts=<gruppo>"
+            quiet: true
+          when: user_set_password
+
+        - name: Password temporanea (solo utente nuovo o senza password; rilanciato non la cambia)
           ansible.builtin.command:
             cmd: chpasswd
             stdin: "{{ user_name }}:{{ hostvars['localhost'].user_secret }}"
-          when: not user_existed
+          when: user_set_password
           no_log: true
 
         - name: Cambio password obbligatorio al primo login (solo utente nuovo)
           ansible.builtin.command: chage -d 0 {{ user_name }}
-          when: not user_existed
+          when: user_set_password
 
     # -------------------------------------------------------------------------
     - name: Sudo
