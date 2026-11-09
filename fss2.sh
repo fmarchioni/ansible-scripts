@@ -1,1 +1,1 @@
-ansible '*fss-prod-02' -m shell -a "sed -i 's|^[[:space:]]*/dev/mapper/vg_data|/dev/mapper/vg_data|' /etc/fstab; grep -c '^/dev/mapper/vg_data' /etc/fstab; findmnt --verify | tail -2"
+ansible fews_nfs -k -K -m shell -a "apt-get update -qq && apt-get install -y open-vm-tools && systemctl is-active open-vm-tools"
