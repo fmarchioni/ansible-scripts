@@ -1,1 +1,1 @@
-ansible fews_fss -m shell -a "df -h /data | tail -1; pvs --noheadings -o pv_name -S vg_name=vg_data | xargs; grep -c '^/dev/mapper/vg_data' /etc/fstab; findmnt -n -o SOURCE /shared; cat /etc/fews-data-shrunk"
+ansible fews_nfs -k -K -m shell -a "dpkg -l open-vm-tools | tail -1; systemctl is-active open-vm-tools"
