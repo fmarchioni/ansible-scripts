@@ -1,0 +1,291 @@
+---
+# =============================================================================
+# FEWS-DEWS - configurazione e collaudo VM con Ansible (prova)
+#
+#   ansible-playbook site.yml --tags verify                 solo verifica (come fews-vm.sh --check)
+#   ansible-playbook site.yml --tags configure --check --diff   cosa cambierebbe, senza modificare
+#   ansible-playbook site.yml --tags configure              applica (idempotente)
+#   ... --limit lab                                         solo sulla VM di prova
+#
+# Usa solo ansible-core + RHEL System Roles (pacchetti RHEL, presenti sulla DVD):
+#   rhel-system-roles.storage  -> LVM + XFS + mount dei dischi dati
+#   rhel-system-roles.timesync -> chrony con server NTP interno
+# =============================================================================
+
+- name: Configurazione VM RHEL FEWS-DEWS
+  hosts: fews_rhel:lab
+  tags: [configure, never]
+  tasks:
+    - name: Fuso orario attuale
+      ansible.builtin.command: timedatectl show -p Timezone --value
+      register: tz_now
+      changed_when: false
+      check_mode: false
+
+    - name: Fuso orario {{ fews_timezone }}
+      ansible.builtin.command: timedatectl set-timezone {{ fews_timezone }}
+      when: tz_now.stdout != fews_timezone
+
+    - name: Dischi dati (LVM vg_data/lv_data, XFS, mount persistente)
+      when: (fews_data_disks | default([]) | length) > 0     # VM senza disco dati: nessuna azione
+      ansible.builtin.include_role:
+        name: rhel-system-roles.storage
+      vars:
+        storage_safe_mode: true        # non formatta mai dischi che contengono gia' dati
+        storage_pools:
+          - name: vg_data
+            disks: "{{ fews_data_disks }}"
+            volumes:
+              - name: lv_data
+                size: "100%"
+                fs_type: xfs
+                fs_create_options: "-K"    # niente discard: su storage thin/cifrato e' molto lento
+                mount_point: "{{ fews_mount }}"
+
+    - name: NTP interno
+      ansible.builtin.include_role:
+        name: rhel-system-roles.timesync
+      vars:
+        timesync_ntp_servers:
+          - hostname: "{{ fews_ntp }}"
+            iburst: true
+
+    - name: Client NFS sulle fss
+      ansible.builtin.dnf:
+        name: nfs-utils
+        state: present
+      when: inventory_hostname in groups['fews_fss']
+
+- name: Identita' di sistema univoca (machine-id e chiavi SSH host)
+  # ansible-playbook site.yml --tags identity --limit fews_rhel -k --check   -> mostra chi verrebbe corretto
+  # ansible-playbook site.yml --tags identity --limit fews_rhel -k           -> corregge e riavvia SOLO i duplicati
+  # Solo il gruppo fews_rhel: il nodo di controllo / lab non viene mai toccato da questo play
+  hosts: fews_rhel
+  tags: [identity, never]
+  gather_facts: true
+  vars:
+    template_machine_id: 1739a2889dc44e25a750fd72933793b3
+  tasks:
+    - name: Individua duplicati confrontando tutte le VM del play
+      ansible.builtin.set_fact:
+        mid_dup: "{{ (ids | select('equalto', ansible_machine_id) | list | length > 1) or ansible_machine_id == template_machine_id }}"
+        ssh_dup: "{{ (ansible_ssh_host_key_ecdsa_public | default('')) != '' and (keys | select('equalto', ansible_ssh_host_key_ecdsa_public | default('')) | list | length > 1) }}"
+      vars:
+        ids: "{{ ansible_play_hosts | map('extract', hostvars, 'ansible_machine_id') | list }}"
+        keys: "{{ ansible_play_hosts | map('extract', hostvars) | map(attribute='ansible_ssh_host_key_ecdsa_public', default='') | list }}"
+
+    - name: Stato attuale
+      ansible.builtin.debug:
+        msg: "machine-id {{ ansible_machine_id }} duplicato={{ mid_dup }} | chiavi SSH duplicate={{ ssh_dup }}"
+
+    - name: Rigenera machine-id e rinomina le voci di boot (kernel predefinito invariato)
+      when: mid_dup | bool
+      ansible.builtin.shell: |
+        set -e
+        OLD=$(cat /etc/machine-id)
+        DEFK=$(grubby --default-kernel)
+        rm -f /etc/machine-id
+        systemd-machine-id-setup >/dev/null
+        NEW=$(cat /etc/machine-id)
+        for f in /boot/loader/entries/"$OLD"-*.conf; do [ -e "$f" ] && mv "$f" "${f/$OLD-/$NEW-}"; done
+        grubby --set-default "$DEFK" >/dev/null
+        [ "$(grubby --default-kernel)" = "$DEFK" ]
+        echo "$OLD -> $NEW (kernel $DEFK)"
+      args:
+        executable: /bin/bash
+      register: mid_out
+
+    - name: Esito machine-id
+      when: mid_out is changed
+      ansible.builtin.debug:
+        var: mid_out.stdout
+
+    - name: Rigenera chiavi SSH host
+      when: ssh_dup | bool
+      ansible.builtin.shell: rm -f /etc/ssh/ssh_host_* && ssh-keygen -A && systemctl restart sshd
+
+    - name: Togli la vecchia chiave dal known_hosts del nodo di controllo
+      when: ssh_dup | bool
+      delegate_to: localhost
+      throttle: 1
+      ansible.builtin.known_hosts:
+        name: "{{ ansible_host }}"
+        state: absent
+
+    - name: Riavvio delle sole VM corrette
+      when: (mid_dup | bool) or (ssh_dup | bool)
+      ansible.builtin.reboot:
+
+# =============================================================================
+# EXTRA post-provisioning (solo su richiesta: --tags extra, oppure --tags vmtools / --tags nfs)
+# =============================================================================
+- name: VMware Tools (open-vm-tools) installati e attivi
+  hosts: fews_rhel:fews_nfs
+  tags: [extra, vmtools, never]
+  tasks:
+    - name: Pacchetti installati
+      ansible.builtin.package_facts:
+
+    - name: Pacchetto open-vm-tools - installato solo se manca (serve un repository disponibile)
+      when: "'open-vm-tools' not in ansible_facts.packages"
+      ansible.builtin.package:
+        name: open-vm-tools
+        state: present
+
+    - name: Servizio VMware Tools attivo e abilitato all'avvio
+      ansible.builtin.service:
+        name: "{{ 'open-vm-tools' if ansible_os_family == 'Debian' else 'vmtoolsd' }}"
+        state: started
+        enabled: true
+
+- name: Shared FS - permessi dell'export sul server NFS
+  hosts: fews_nfs
+  tags: [extra, nfs, never]
+  tasks:
+    - name: "{{ fews_nfs_export }} con permessi {{ fews_nfs_export_mode }}"
+      ansible.builtin.file:
+        path: "{{ fews_nfs_export }}"
+        state: directory
+        mode: "{{ fews_nfs_export_mode }}"
+
+- name: Shared FS - mount persistente sulle fss
+  hosts: fews_fss
+  tags: [extra, nfs, never]
+  tasks:
+    - name: Pacchetti installati
+      ansible.builtin.package_facts:
+
+    - name: Client NFS presente
+      ansible.builtin.assert:
+        that: "'nfs-utils' in ansible_facts.packages"
+        fail_msg: "nfs-utils non installato su {{ inventory_hostname }}: installarlo prima (DVD o repo)"
+
+    - name: Cartella di mount {{ fews_nfs_mountpoint }}
+      ansible.builtin.file:
+        path: "{{ fews_nfs_mountpoint }}"
+        state: directory
+        mode: "0755"
+
+    - name: Voce in /etc/fstab (montaggio al boot, per IP finche' manca il record DNS)
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^\S+\s+{{ fews_nfs_mountpoint }}\s'
+        line: "{{ fews_nfs_server }}:{{ fews_nfs_export }} {{ fews_nfs_mountpoint }} nfs {{ fews_nfs_mount_opts }} 0 0"
+        backup: true
+
+    - name: Stato del mount
+      ansible.builtin.command: findmnt -n -o SOURCE {{ fews_nfs_mountpoint }}
+      register: nfs_mnt
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Monta lo shared FS
+      when: nfs_mnt.stdout != fews_nfs_server ~ ':' ~ fews_nfs_export
+      ansible.builtin.command: mount {{ fews_nfs_mountpoint }}
+
+    - name: Prova di scrittura come root (file temporaneo creato e cancellato)
+      ansible.builtin.shell: |
+        f={{ fews_nfs_mountpoint }}/.fews-write-test-{{ inventory_hostname }}
+        touch "$f" && rm -f "$f"
+      changed_when: false
+
+- name: Verifica VM FEWS-DEWS (sola lettura)
+  hosts: fews_rhel:fews_nfs:lab
+  tags: [verify]
+  gather_facts: true
+  tasks:
+    - name: Pacchetti installati
+      ansible.builtin.package_facts:
+
+    - name: Identita' e rete
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - ansible_hostname == inventory_hostname or inventory_hostname in groups['lab']
+          - ansible_default_ipv4.address == ansible_host
+          - ansible_default_ipv4.gateway == fews_gateway
+          - fews_dns in ansible_dns.nameservers
+          - fews_domain in (ansible_dns.search | default([]))
+          - ansible_machine_id | length == 32
+        fail_msg: "Identita'/rete non conformi su {{ inventory_hostname }}"
+
+    - name: Risorse (vCPU, RAM, disco OS)
+      when: inventory_hostname not in groups['fews_nfs']
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - ansible_processor_vcpus == fews_cpu
+          - ansible_memtotal_mb >= fews_ram_gb * 1024 * 0.9
+          - ((ansible_devices.sda.sectors | int) * (ansible_devices.sda.sectorsize | int) / 1024**3) | round | int >= fews_os_disk_gb - 2
+        fail_msg: "Risorse diverse dall'inventario su {{ inventory_hostname }}"
+
+    - name: Dati montati e persistenti
+      when: inventory_hostname not in groups['fews_nfs'] and (fews_mount | default('')) != ''
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - ansible_mounts | selectattr('mount', 'equalto', fews_mount) | selectattr('device', 'equalto', '/dev/mapper/vg_data-lv_data') | list | length == 1
+        fail_msg: "{{ fews_mount }} non montato da vg_data-lv_data su {{ inventory_hostname }}"
+
+    - name: Pacchetti richiesti (perl ovunque, nfs-utils sulle fss)
+      when: inventory_hostname not in groups['fews_nfs']
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - "'perl' in ansible_facts.packages"
+          - inventory_hostname not in groups['fews_fss'] or 'nfs-utils' in ansible_facts.packages
+        fail_msg: "Pacchetti mancanti su {{ inventory_hostname }}"
+
+    - name: VMware Tools installati
+      ansible.builtin.assert:
+        quiet: true
+        that: "'open-vm-tools' in ansible_facts.packages"
+        fail_msg: "open-vm-tools non installato su {{ inventory_hostname }}"
+
+    - name: Shared FS montato sulle fss
+      when: inventory_hostname in groups['fews_fss']
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - ansible_mounts | selectattr('mount', 'equalto', fews_nfs_mountpoint) | selectattr('fstype', 'match', '^nfs') | list | length == 1
+        fail_msg: "{{ fews_nfs_mountpoint }} (NFS) non montato su {{ inventory_hostname }}"
+
+    - name: Fuso orario attuale
+      ansible.builtin.command: timedatectl show -p Timezone --value
+      register: tz_now
+      changed_when: false
+      check_mode: false
+
+    - name: Fuso orario
+      ansible.builtin.assert:
+        quiet: true
+        that: tz_now.stdout == fews_timezone
+        fail_msg: "Fuso orario {{ tz_now.stdout }} su {{ inventory_hostname }} (atteso {{ fews_timezone }})"
+
+    # ---- controlli GLOBALI: confrontano tutte le VM tra loro ----
+    - name: machine-id univoco su tutte le VM (controllo globale)
+      run_once: true
+      vars:
+        ids: "{{ ansible_play_hosts | map('extract', hostvars, 'ansible_machine_id') | list }}"
+      ansible.builtin.assert:
+        that: ids | unique | length == ids | length
+        fail_msg: "machine-id DUPLICATI tra le VM: {{ dict(ansible_play_hosts | zip(ids)) }}"
+        success_msg: "machine-id univoci su {{ ids | length }} VM"
+
+    - name: Chiavi SSH host univoche su tutte le VM (controllo globale)
+      run_once: true
+      vars:
+        keys: "{{ ansible_play_hosts | map('extract', hostvars) | map(attribute='ansible_ssh_host_key_ecdsa_public', default='') | list }}"
+      ansible.builtin.assert:
+        that: keys | reject('equalto', '') | unique | length == keys | reject('equalto', '') | length
+        fail_msg: "Chiavi SSH host DUPLICATE tra le VM"
+        success_msg: "Chiavi SSH host univoche su {{ keys | length }} VM"
+
+    - name: IP univoci (controllo globale)
+      run_once: true
+      vars:
+        ips: "{{ ansible_play_hosts | map('extract', hostvars, ['ansible_default_ipv4', 'address']) | list }}"
+      ansible.builtin.assert:
+        that: ips | unique | length == ips | length
+        success_msg: "IP univoci su {{ ips | length }} VM"

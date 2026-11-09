@@ -1,0 +1,228 @@
+# =============================================================================
+# Dischi: estensione di /opt (disco di sistema) e rimozione del disco /data
+# Nessun dato del cliente nel file: le VM si scelgono con variabili / inventario.
+#
+# ---- /opt: +N GB sul disco di sistema ----------------------------------------
+#  1. ansible-playbook disks.yml --tags check                       stato attuale (sola lettura)
+#  2. (vCD) si ingrandisce il disco di sistema delle VM interessate
+#  3. ansible-playbook disks.yml --tags opt -e "opt_hosts='fews_rhel:!*postgres*'"
+#     rileva il disco piu' grande, allarga partizione e PV, assegna TUTTO lo spazio
+#     nuovo a /opt (a caldo). Se il disco non e' stato ingrandito non fa nulla.
+#
+# ---- /data: rimozione del disco ----------------------------------------------
+#  1. ansible-playbook disks.yml --tags data-prepare -e "data_hosts='*adminint*:*dbproxy*'"
+#     verifica che /data sia vuoto e non in uso, smonta, toglie fstab, rimuove
+#     LVM e stacca il disco dal sistema operativo. Stampa quale disco rimuovere in vCD.
+#  2. (vCD) si rimuove il disco indicato
+#  3. ansible-playbook disks.yml --tags data-verify -e "data_hosts='*adminint*:*dbproxy*'"
+#
+# Prova sempre prima su UNA VM: -e "opt_hosts='*adminint-prod-01'" (idem data_hosts).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+- name: Dischi | stato attuale (sola lettura)
+  hosts: "{{ check_hosts | default('fews_rhel') }}"
+  gather_facts: false
+  tags: [check, never]
+  tasks:
+    - name: Dischi, LVM e mount
+      ansible.builtin.shell: |
+        lsblk -o NAME,SIZE,TYPE,MOUNTPOINT -e 11 | sed 's/^/  /'
+        echo "  VG:"; vgs --noheadings -o vg_name,vg_size,vg_free --units g | sed 's/^/   /'
+        echo "  /opt e /data:"; df -h /opt /data 2>/dev/null | tail -n +2 | sed 's/^/   /'
+      register: d_state
+      changed_when: false
+    - name: Esito
+      ansible.builtin.debug:
+        msg: "{{ d_state.stdout_lines }}"
+
+# -----------------------------------------------------------------------------
+- name: Dischi | estensione di /opt
+  hosts: "{{ opt_hosts | default('none') }}"
+  gather_facts: false
+  tags: [opt, never]
+  serial: 1                                # una VM alla volta
+  vars:
+    opt_vg: rhel
+    opt_lv: opt
+    opt_mount: /opt
+  tasks:
+    - name: /opt e' il volume {{ opt_vg }}/{{ opt_lv }}
+      ansible.builtin.command: findmnt -n -o SOURCE {{ opt_mount }}
+      register: o_src
+      changed_when: false
+      failed_when: o_src.stdout != '/dev/mapper/' ~ opt_vg ~ '-' ~ opt_lv
+
+    - name: PV del volume group {{ opt_vg }}
+      ansible.builtin.shell: pvs --noheadings -o pv_name -S vg_name={{ opt_vg }} | xargs
+      register: o_pv
+      changed_when: false
+      failed_when: o_pv.stdout == '' or (o_pv.stdout.split() | length) != 1
+
+    - name: Disco e numero di partizione del PV
+      ansible.builtin.shell: |
+        p=$(basename {{ o_pv.stdout }})
+        echo "$(lsblk -no PKNAME /dev/$p | head -1) $(cat /sys/class/block/$p/partition)"
+      register: o_dp
+      changed_when: false
+
+    - name: Variabili
+      ansible.builtin.set_fact:
+        o_disk: "{{ o_dp.stdout.split()[0] }}"
+        o_part: "{{ o_dp.stdout.split()[1] }}"
+
+    - name: La partizione del PV e' l'ultima del disco (requisito per allargarla)
+      ansible.builtin.shell: lsblk -nlo NAME,TYPE /dev/{{ o_disk }} | awk '$2=="part"{n=$1} END{print n}'
+      register: o_last
+      changed_when: false
+      failed_when: o_last.stdout != (o_pv.stdout | basename)
+
+    - name: Rilettura dimensione del disco (dopo l'ingrandimento in vCD)
+      ansible.builtin.shell: "[ -e /sys/class/block/{{ o_disk }}/device/rescan ] && echo 1 > /sys/class/block/{{ o_disk }}/device/rescan || true"
+      changed_when: false
+
+    - name: Strumenti (growpart, sgdisk per dischi GPT)
+      ansible.builtin.dnf:
+        name: [cloud-utils-growpart, gdisk]
+        state: present
+      when: opt_install_tools | default(true) | bool
+
+    - name: Spazio da aggiungere alla partizione?
+      ansible.builtin.command: growpart --dry-run /dev/{{ o_disk }} {{ o_part }}
+      register: o_dry
+      changed_when: false
+      failed_when: o_dry.rc not in [0, 1]
+
+    - name: Allarga partizione e PV
+      when: "'CHANGE' in o_dry.stdout and 'NOCHANGE' not in o_dry.stdout"
+      block:
+        - name: growpart
+          ansible.builtin.command: growpart /dev/{{ o_disk }} {{ o_part }}
+        - name: pvresize
+          ansible.builtin.command: pvresize {{ o_pv.stdout }}
+
+    - name: Spazio libero nel VG {{ opt_vg }} (GB)
+      ansible.builtin.shell: vgs --noheadings --units g --nosuffix -o vg_free {{ opt_vg }} | xargs
+      register: o_free
+      changed_when: false
+
+    - name: Assegna tutto lo spazio libero a /opt (filesystem allargato a caldo)
+      ansible.builtin.command: lvextend -r -l +100%FREE /dev/{{ opt_vg }}/{{ opt_lv }}
+      when: (o_free.stdout | float) > 0.1
+
+    - name: Risultato
+      ansible.builtin.shell: df -h {{ opt_mount }} | tail -1
+      register: o_df
+      changed_when: false
+    - ansible.builtin.debug:
+        msg: "/opt ora: {{ o_df.stdout }}  {{ '' if ('CHANGE' in o_dry.stdout and 'NOCHANGE' not in o_dry.stdout) or (o_free.stdout | float) > 0.1 else '(nessuno spazio nuovo: il disco e stato ingrandito in vCD?)' }}"
+
+# -----------------------------------------------------------------------------
+- name: Dischi | rimozione di /data - preparazione lato sistema operativo
+  hosts: "{{ data_hosts | default('none') }}"
+  gather_facts: false
+  tags: [data-prepare, never]
+  serial: 1
+  vars:
+    data_mount: /data
+    data_vg: vg_data
+  tasks:
+    - name: Stato di {{ data_mount }}
+      ansible.builtin.shell: |
+        echo "src=$(findmnt -n -o SOURCE {{ data_mount }})"
+        echo "files=$(find {{ data_mount }} -mindepth 1 -not -name lost+found 2>/dev/null | wc -l)"
+        echo "pvs=$(pvs --noheadings -o pv_name -S vg_name={{ data_vg }} | xargs)"
+        echo "fstab=$(grep -cE '^[^#].*[[:space:]]{{ data_mount }}[[:space:]]' /etc/fstab)"
+      register: dr
+      changed_when: false
+
+    - name: Variabili
+      ansible.builtin.set_fact:
+        dr_src: "{{ dr.stdout_lines[0].split('=', 1)[1] }}"
+        dr_files: "{{ dr.stdout_lines[1].split('=', 1)[1] | int }}"
+        dr_pvs: "{{ dr.stdout_lines[2].split('=', 1)[1].split() }}"
+        dr_fstab: "{{ dr.stdout_lines[3].split('=', 1)[1] | int }}"
+
+    - name: Gia' rimosso?
+      ansible.builtin.debug:
+        msg: "{{ data_mount }} e {{ data_vg }} non presenti: niente da fare"
+      when: dr_src == '' and dr_pvs | length == 0 and (dr_fstab | int) == 0
+
+    - name: Rimozione
+      when: not (dr_src == '' and dr_pvs | length == 0 and (dr_fstab | int) == 0)
+      block:
+        - name: "{{ data_mount }} vuoto (stop se contiene file o cartelle)"
+          ansible.builtin.assert:
+            that: (dr_files | int) == 0 or (data_force | default(false) | bool)
+            fail_msg: "{{ data_mount }} contiene {{ dr_files }} elementi: interrotto. Verificare con il cliente (forzabile con -e data_force=true)."
+            quiet: true
+
+        - name: Nessun processo usa {{ data_mount }}
+          ansible.builtin.shell: fuser -m {{ data_mount }} 2>/dev/null | xargs
+          register: dr_use
+          changed_when: false
+          failed_when: dr_use.stdout != ''
+          when: dr_src != ''
+
+        - name: Smonta {{ data_mount }}
+          ansible.builtin.command: umount {{ data_mount }}
+          when: dr_src != ''
+
+        - name: Toglie {{ data_mount }} da /etc/fstab (con backup)
+          ansible.builtin.lineinfile:
+            path: /etc/fstab
+            regexp: '^[^#].*\s{{ data_mount }}\s'
+            state: absent
+            backup: true
+
+        - name: systemd rilegge fstab
+          ansible.builtin.systemd:
+            daemon_reload: true
+
+        - name: Rimuove volume group {{ data_vg }} e i PV
+          ansible.builtin.shell: |
+            vgremove -y {{ data_vg }}
+            pvremove -y {{ dr_pvs | join(' ') }}
+          when: dr_pvs | length > 0
+
+        - name: Rimuove la cartella vuota {{ data_mount }}
+          ansible.builtin.file:
+            path: "{{ data_mount }}"
+            state: absent
+          when: (dr_files | int) == 0
+
+    - name: Disco/i da rimuovere in vCD (posizione SCSI host:canale:target:lun)
+      ansible.builtin.shell: |
+        for p in {{ dr_pvs | join(' ') }}; do
+          d=$(basename $p)
+          echo "$d $(lsblk -dno SIZE /dev/$d) SCSI $(lsblk -dno HCTL /dev/$d)"
+        done
+      register: dr_disks
+      changed_when: false
+      when: dr_pvs | length > 0
+
+    - name: Stacca il disco dal sistema operativo (prima della rimozione in vCD)
+      ansible.builtin.shell: "[ -e /sys/block/{{ item | basename }}/device/delete ] && echo 1 > /sys/block/{{ item | basename }}/device/delete || true"
+      loop: "{{ dr_pvs }}"
+      when: dr_pvs | length > 0
+
+    - name: Da comunicare per la rimozione in vCD
+      ansible.builtin.debug:
+        msg: "{{ dr_disks.stdout_lines | default(['nessun disco']) }}  (target SCSI = 'unita'' sul bus 0 in vCD)"
+
+# -----------------------------------------------------------------------------
+- name: Dischi | rimozione di /data - verifica dopo vCD
+  hosts: "{{ data_hosts | default('none') }}"
+  gather_facts: false
+  tags: [data-verify, never]
+  tasks:
+    - name: Verifica
+      ansible.builtin.shell: |
+        echo "dischi: $(lsblk -dno NAME,SIZE -e 11 | xargs)"
+        echo "vg_data: $(vgs vg_data >/dev/null 2>&1 && echo PRESENTE || echo assente)"
+        echo "fstab /data: $(grep -cE '^[^#].*[[:space:]]/data[[:space:]]' /etc/fstab)"
+        echo "unita' systemd in errore: $(systemctl --failed --no-legend | wc -l)"
+      register: dv
+      changed_when: false
+    - ansible.builtin.debug:
+        msg: "{{ dv.stdout_lines }}"
