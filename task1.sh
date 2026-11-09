@@ -3,6 +3,7 @@
 # TASK 1 - Fotografia iniziale dei dischi (SOLA LETTURA)
 # Mostra per ogni VM RHEL: dischi, partizioni, volumi LVM, spazio di /opt e /data.
 # Linux: lsblk, vgs, df -h /opt /data
+#
 # Da lanciare da /root/fews-ansible (ansible.cfg, inventory.yml, disks.yml, site.yml)
 # =============================================================================
 set -uo pipefail
