@@ -1,1 +1,1 @@
-ansible fews_nfs -k -K -m shell -a "dpkg -l open-vm-tools | tail -1; systemctl is-active open-vm-tools"
+ansible-playbook disks.yml --tags check | tee log-collaudo-dischi-$(date +%F_%H%M).log
