@@ -226,3 +226,192 @@
       changed_when: false
     - ansible.builtin.debug:
         msg: "{{ dv.stdout_lines }}"
+
+# =============================================================================
+# DISCO CONDIVISO: riduzione di /data su client (fss, openarchive) e estensione
+# della share sul server NFS.
+#
+#  1. ansible-playbook disks.yml --tags data-shrink -e "shrink_hosts='fews_fss:*openarchive*'"
+#     DISTRUTTIVO su /data: ricrea /data con un disco in meno e stampa il disco da rimuovere.
+#  2. (vCD) rimozione dei dischi indicati + aggiunta di 4 dischi da 150 GB al server NFS
+#  3. ansible-playbook disks.yml --tags data-shrink-verify -e "shrink_hosts='fews_fss:*openarchive*'"
+#  4. ansible-playbook disks.yml --tags share-extend -k -K          (server NFS, Ubuntu)
+#  5. ansible-playbook disks.yml --tags share-verify -e "share_clients='fews_fss:*openarchive*'"
+# =============================================================================
+
+- name: Dischi | riduzione di /data (DISTRUTTIVO) - ricrea /data con un disco in meno
+  hosts: "{{ shrink_hosts | default('none') }}"
+  gather_facts: false
+  tags: [data-shrink, never]
+  serial: 1
+  any_errors_fatal: true            # alla prima VM con errori ci si ferma
+  vars:
+    shrink_mount: /data
+    shrink_vg: vg_data
+    shrink_lv: lv_data
+    shrink_marker: /etc/fews-data-shrunk
+  tasks:
+    - name: Gia' ridotto?
+      ansible.builtin.stat:
+        path: "{{ shrink_marker }}"
+      register: sh_mark
+
+    - name: Gia' fatto su questa VM
+      ansible.builtin.debug:
+        msg: "{{ shrink_mount }} gia' ridotto in precedenza ({{ shrink_marker }}): niente da fare"
+      when: sh_mark.stat.exists
+
+    - name: Riduzione
+      when: not sh_mark.stat.exists
+      block:
+        - name: Stato attuale
+          ansible.builtin.shell: |
+            echo "src=$(findmnt -n -o SOURCE {{ shrink_mount }})"
+            echo "pvs=$(pvs --noheadings -o pv_name -S vg_name={{ shrink_vg }} | xargs -n1 | sort | xargs)"
+            echo "fstab=$(awk '$1 !~ /^#/ && $2 == "{{ shrink_mount }}" {print $1}' /etc/fstab)"
+          register: sh
+          changed_when: false
+
+        - name: Variabili
+          ansible.builtin.set_fact:
+            sh_src: "{{ sh.stdout_lines[0].split('=', 1)[1] }}"
+            sh_pvs: "{{ sh.stdout_lines[1].split('=', 1)[1].split() }}"
+            sh_fstab_dev: "{{ sh.stdout_lines[2].split('=', 1)[1] }}"
+
+        - name: Controlli (montato da {{ shrink_vg }}, almeno 2 dischi, riga fstab presente)
+          ansible.builtin.assert:
+            that:
+              - sh_src == '/dev/mapper/' ~ shrink_vg ~ '-' ~ shrink_lv
+              - sh_pvs | length >= 2
+              - sh_fstab_dev != ''
+            fail_msg: "Stato inatteso: src={{ sh_src }} pvs={{ sh_pvs }} fstab={{ sh_fstab_dev }}: interrotto, nessuna modifica"
+            quiet: true
+
+        - name: Nessun processo usa {{ shrink_mount }} (servizi FEWS fermi)
+          ansible.builtin.shell: fuser -m {{ shrink_mount }} 2>/dev/null | xargs
+          register: sh_use
+          changed_when: false
+          failed_when: sh_use.stdout != ''
+
+        - name: Disco da togliere (l'ultimo del volume group)
+          ansible.builtin.shell: |
+            d=$(basename {{ sh_pvs[-1] }})
+            echo "$d $(lsblk -dno SIZE /dev/$d | xargs) SCSI $(lsblk -dno HCTL /dev/$d | xargs)"
+          register: sh_disk
+          changed_when: false
+
+        - name: Ricrea {{ shrink_mount }} senza il disco {{ sh_pvs[-1] }}
+          ansible.builtin.shell: |
+            set -e
+            cp -a /etc/fstab /etc/fstab.bak-shrink-$(date +%F_%H%M)
+            umount {{ shrink_mount }}
+            lvremove -y {{ shrink_vg }}/{{ shrink_lv }}
+            vgreduce {{ shrink_vg }} {{ sh_pvs[-1] }}
+            pvremove -y {{ sh_pvs[-1] }}
+            lvcreate -y -l 100%FREE -n {{ shrink_lv }} {{ shrink_vg }}
+            mkfs.xfs -f -K /dev/{{ shrink_vg }}/{{ shrink_lv }}
+            case "{{ sh_fstab_dev }}" in
+              UUID=*) new=$(blkid -s UUID -o value /dev/{{ shrink_vg }}/{{ shrink_lv }})
+                      sed -i "s|^{{ sh_fstab_dev }}\([[:space:]]\+{{ shrink_mount | regex_replace('/', '\\/') }}[[:space:]]\)|UUID=$new\1|" /etc/fstab ;;
+            esac
+            systemctl daemon-reload
+            mount {{ shrink_mount }}
+            restorecon -R {{ shrink_mount }} 2>/dev/null || true
+            echo "$(date '+%F %T') ridotto, rimosso {{ sh_pvs[-1] }}" > {{ shrink_marker }}
+
+        - name: Stacca il disco tolto dal sistema operativo
+          ansible.builtin.shell: "[ -e /sys/block/{{ sh_pvs[-1] | basename }}/device/delete ] && echo 1 > /sys/block/{{ sh_pvs[-1] | basename }}/device/delete || true"
+
+        - name: Nuovo stato
+          ansible.builtin.shell: df -h {{ shrink_mount }} | tail -1; findmnt --verify --tab-file /etc/fstab >/dev/null && echo "fstab OK"
+          register: sh_after
+          changed_when: false
+
+        - name: Da comunicare per la rimozione in vCD
+          ansible.builtin.debug:
+            msg: "DA RIMUOVERE IN vCD: {{ sh_disk.stdout }} | /data ora: {{ sh_after.stdout_lines | join(' | ') }}"
+
+- name: Dischi | riduzione di /data - verifica dopo vCD
+  hosts: "{{ shrink_hosts | default('none') }}"
+  gather_facts: false
+  tags: [data-shrink-verify, never]
+  tasks:
+    - name: Verifica
+      ansible.builtin.shell: |
+        echo "dischi: $(lsblk -dno NAME,SIZE -e 11 | xargs)"
+        echo "/data: $(df -h /data | tail -1 | awk '{print $2" totale, "$3" usati"}')"
+        echo "PV in vg_data: $(pvs --noheadings -o pv_name -S vg_name=vg_data | xargs)"
+        echo "/shared: $(findmnt -n -o SOURCE /shared)"
+        echo "unita' systemd in errore: $(systemctl --failed --no-legend | wc -l)"
+      register: sv
+      changed_when: false
+    - ansible.builtin.debug:
+        msg: "{{ sv.stdout_lines }}"
+
+- name: Dischi | estensione della share sul server NFS (a caldo)
+  hosts: "{{ share_server | default('fews_nfs') }}"
+  gather_facts: false
+  become: true
+  tags: [share-extend, never]
+  vars:
+    share_vg: vg_data
+    share_lv: lv_data
+    share_mount: /data
+    share_new_disks: 4               # dischi attesi, aggiunti in vCD
+  tasks:
+    - name: Rileva i dischi nuovi (scansione SCSI)
+      ansible.builtin.shell: for h in /sys/class/scsi_host/host*/scan; do [ -e "$h" ] && echo '- - -' > "$h"; done; true
+      changed_when: false
+
+    - name: Dischi liberi (senza partizioni, non LVM, non montati)
+      ansible.builtin.shell: |
+        used=$(pvs --noheadings -o pv_name | xargs)
+        for d in $(lsblk -dno NAME,TYPE | awk '$2=="disk"{print $1}'); do
+          [ "$(lsblk -no NAME /dev/$d | wc -l)" -eq 1 ] || continue          # ha partizioni/volumi
+          echo " $used " | grep -q " /dev/$d " && continue                    # gia PV
+          blkid /dev/$d >/dev/null 2>&1 && continue                           # contiene un filesystem/firma
+          echo /dev/$d
+        done
+      register: sx_free
+      changed_when: false
+
+    - name: Stato attuale della share
+      ansible.builtin.shell: df -h {{ share_mount }} | tail -1
+      register: sx_before
+      changed_when: false
+
+    - name: Numero di dischi nuovi atteso
+      ansible.builtin.assert:
+        that: (sx_free.stdout_lines | length) in [0, share_new_disks | int]
+        fail_msg: "Trovati {{ sx_free.stdout_lines | length }} dischi liberi ({{ sx_free.stdout_lines }}), attesi {{ share_new_disks }}: interrotto"
+        quiet: true
+
+    - name: Aggiunge i dischi alla share ed estende il filesystem
+      when: sx_free.stdout_lines | length > 0
+      ansible.builtin.shell: |
+        set -e
+        pvcreate -y {{ sx_free.stdout_lines | join(' ') }}
+        vgextend {{ share_vg }} {{ sx_free.stdout_lines | join(' ') }}
+        lvextend -r -l +100%FREE /dev/{{ share_vg }}/{{ share_lv }}
+
+    - name: Risultato
+      ansible.builtin.shell: df -h {{ share_mount }} | tail -1; exportfs -v | grep -c '^{{ share_mount }}'
+      register: sx_after
+      changed_when: false
+
+    - ansible.builtin.debug:
+        msg: "Prima: {{ sx_before.stdout }} | Dopo: {{ sx_after.stdout_lines[0] }} | client nell'export: {{ sx_after.stdout_lines[1] }}"
+
+- name: Dischi | verifica della share dai client
+  hosts: "{{ share_clients | default('none') }}"
+  gather_facts: false
+  tags: [share-verify, never]
+  tasks:
+    - name: Spazio e scrittura come fews-user
+      ansible.builtin.shell: |
+        df -h /shared | tail -1
+        sudo -u fews-user touch /shared/.test-share && echo SCRITTURA_OK && rm -f /shared/.test-share
+      register: cv
+      changed_when: false
+    - ansible.builtin.debug:
+        msg: "{{ cv.stdout_lines }}"
