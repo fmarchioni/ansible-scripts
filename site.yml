@@ -198,6 +198,13 @@
     - name: Pacchetti installati
       ansible.builtin.package_facts:
 
+    - name: DNS effettivi (Ubuntu usa systemd-resolved, resolv.conf punta a 127.0.0.53)
+      ansible.builtin.shell: resolvectl dns; resolvectl domain
+      register: v_resolved
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == 'Debian'
+
     - name: Identita' e rete
       ansible.builtin.assert:
         quiet: true
@@ -205,8 +212,8 @@
           - ansible_hostname == inventory_hostname or inventory_hostname in groups['lab']
           - ansible_default_ipv4.address == ansible_host
           - ansible_default_ipv4.gateway == fews_gateway
-          - fews_dns in ansible_dns.nameservers
-          - fews_domain in (ansible_dns.search | default([]))
+          - fews_dns in ansible_dns.nameservers or (v_resolved.stdout | default('')) is search(fews_dns | regex_escape)
+          - fews_domain in (ansible_dns.search | default([])) or (v_resolved.stdout | default('')) is search(fews_domain | regex_escape)
           - ansible_machine_id | length == 32
         fail_msg: "Identita'/rete non conformi su {{ inventory_hostname }}"
 
