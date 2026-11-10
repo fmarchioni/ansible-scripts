@@ -1,0 +1,56 @@
+# =============================================================================
+# Controllo finale per la consegna delle VM (SOLA LETTURA, output minimo)
+#
+#   ANSIBLE_DISPLAY_OK_HOSTS=false ANSIBLE_DISPLAY_SKIPPED_HOSTS=false \
+#     ansible-playbook delivery.yml -l 'all:!lab' -k -K ; cat esito-consegna.txt
+#
+# Su ogni VM esegue delivery-check.sh (stessa cartella). Scrive in esito-consegna.txt
+# solo i problemi (KO bloccanti, WARN da segnalare) e l'esito:
+#   "AMBIENTE PRONTO PER LA CONSEGNA"  oppure  "AMBIENTE NON PRONTO: N problemi bloccanti"
+# Nessun dato del cliente nel file: i valori attesi vengono dall'inventario.
+# =============================================================================
+- name: Consegna | controlli sulle VM
+  hosts: "{{ delivery_hosts | default('fews_rhel:fews_nfs') }}"
+  gather_facts: false
+  tasks:
+    - name: Controlli
+      ansible.builtin.script: >-
+        {{ playbook_dir }}/delivery-check.sh
+        host={{ inventory_hostname }}
+        ip={{ ansible_host | default('') }}
+        dns={{ fews_dns | default('') }}
+        opt_min={{ 20 if (inventory_hostname is not search('postgres') and inventory_hostname not in groups['fews_nfs']) else 0 }}
+        data={{ (fews_mount | default('')) if (fews_mount | default('')) != '' else 'none' }}
+        shared={{ 'yes' if (inventory_hostname in groups['fews_fss'] or inventory_hostname is search('openarchive')) else 'no' }}
+        pg={{ 'yes' if inventory_hostname is search('postgres') else 'no' }}
+        nfssrv={{ 'yes' if inventory_hostname in groups['fews_nfs'] else 'no' }}
+      register: dc
+      changed_when: false
+
+    - name: Esito
+      run_once: true
+      vars:
+        hosts_all: "{{ ansible_play_hosts_all }}"
+        report: |-
+          {% set n = namespace(ko=0, warn=0, lines=[], ids={}) %}
+          {% for h in hosts_all | sort %}
+          {%   set out = hostvars[h].dc.stdout_lines | default([]) if hostvars[h].dc is defined and hostvars[h].dc.stdout_lines is defined else ['KO   non raggiungibile o controllo non eseguito'] %}
+          {%   for l in out %}
+          {%     if l.startswith('KO') %}{% set n.ko = n.ko + 1 %}{% set n.lines = n.lines + [h ~ ': ' ~ l] %}
+          {%     elif l.startswith('WARN') %}{% set n.warn = n.warn + 1 %}{% set n.lines = n.lines + [h ~ ': ' ~ l] %}
+          {%     elif l.startswith('ID') %}{% set parts = l.split() %}
+          {%       for v in parts[1:] %}{% set _ = n.ids.update({v: (n.ids[v] | default([])) + [h]}) %}{% endfor %}
+          {%     endif %}
+          {%   endfor %}
+          {% endfor %}
+          {% for v, hs in n.ids.items() if hs | length > 1 %}{% set n.ko = n.ko + 1 %}{% set n.lines = n.lines + ['identita duplicata (machine-id o chiave SSH) su: ' ~ (hs | join(', '))] %}{% endfor %}
+          VM controllate: {{ hosts_all | length }} | KO: {{ n.ko }} | WARN: {{ n.warn }}
+          {% for l in n.lines %}  {{ l }}
+          {% endfor %}
+          {% if n.ko == 0 %}==> AMBIENTE PRONTO PER LA CONSEGNA{% if n.warn > 0 %} (con {{ n.warn }} segnalazioni WARN da comunicare){% endif %}
+          {% else %}==> AMBIENTE NON PRONTO: {{ n.ko }} problemi bloccanti{% endif %}
+      ansible.builtin.copy:
+        dest: "{{ delivery_report | default(playbook_dir ~ '/esito-consegna.txt') }}"
+        content: "{{ (report.split('\n') | map('trim') | reject('equalto', '') | join('\n')) ~ '\n' }}"
+        mode: "0600"
+      delegate_to: localhost
