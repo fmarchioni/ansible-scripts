@@ -366,7 +366,7 @@
     - name: Dischi liberi (senza partizioni, non LVM, non montati)
       ansible.builtin.shell: |
         used=$(pvs --noheadings -o pv_name | xargs)
-        for d in $(lsblk -dno NAME,TYPE | awk '$2=="disk"{print $1}'); do
+        for d in $(lsblk -dno NAME,TYPE -e 2,7,11 | awk '$2=="disk" && $1 !~ /^(fd|sr|loop)/ {print $1}'); do   # no floppy/cdrom/loop
           [ "$(lsblk -no NAME /dev/$d | wc -l)" -eq 1 ] || continue          # ha partizioni/volumi
           echo " $used " | grep -q " /dev/$d " && continue                    # gia PV
           blkid /dev/$d >/dev/null 2>&1 && continue                           # contiene un filesystem/firma
